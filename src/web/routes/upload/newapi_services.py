@@ -70,7 +70,7 @@ def _to_response(svc) -> NewapiServiceResponse:
 
 def _validated_newapi_api_key(api_key: str) -> str:
     try:
-        return normalize_authorization_token(api_key)
+        return normalize_authorization_token(api_key, header_name="Root Token / API Key")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
