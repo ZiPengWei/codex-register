@@ -4,28 +4,20 @@
 """
 
 import base64
+import json
+import logging
 import math
 import re
-import json
-import time
-import logging
 import secrets
-from typing import Optional, Dict, Any, Tuple, Callable
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Optional, Dict, Any, Tuple, Callable
 
 from curl_cffi import requests as cffi_requests
 
+from .http_client import OpenAIHTTPClient
 from .openai.oauth import OAuthManager, OAuthStart
-from .http_client import OpenAIHTTPClient, HTTPClientError
-from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType
-from ..services.base import (
-    EmailProviderBackoffState,
-    OTP_NO_OPENAI_SENDER_ERROR,
-    OTPNoOpenAISenderEmailServiceError,
-)
-from ..database import crud
-from ..database.session import get_db
 from ..config.constants import (
     OPENAI_API_ENDPOINTS,
     OPENAI_PAGE_TYPES,
@@ -33,11 +25,16 @@ from ..config.constants import (
     OTP_CODE_PATTERN,
     DEFAULT_PASSWORD_LENGTH,
     PASSWORD_CHARSET,
-    AccountStatus,
-    TaskStatus,
 )
 from ..config.settings import get_settings
-
+from ..database import crud
+from ..database.session import get_db
+from ..services import BaseEmailService
+from ..services.base import (
+    EmailProviderBackoffState,
+    OTP_NO_OPENAI_SENDER_ERROR,
+    OTPNoOpenAISenderEmailServiceError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -638,6 +635,75 @@ class RegistrationEngine:
             started_at=time.time(),
         )
         return code
+
+    def _await_verification_code_with_resends(
+        self,
+        resend_callback: Callable[[], bool],
+        *,
+        timeout_retry_log_template: str = "收件箱未找到验证码，第 {attempt} 次重新发送验证码...",
+        non_openai_retry_log_template: str = "检测到非 OpenAI 发件人干扰，第 {attempt} 次重新发送验证码...",
+        timeout_retry_status_template: Optional[str] = None,
+        non_openai_retry_status_template: Optional[str] = None,
+        step_index: Optional[int] = None,
+    ) -> Tuple[Optional[str], Optional[PhaseResult]]:
+        """等待验证码，并在可重试场景下按独立预算触发重发。"""
+        settings = get_settings()
+        timeout_resend_max = settings.email_code_resend_max_retries
+        non_openai_sender_resend_max = settings.email_code_non_openai_sender_resend_max_retries
+        timeout_resend_used = 0
+        non_openai_sender_resend_used = 0
+        otp_phase_started_at = time.time()
+        otp_phase: Optional[PhaseResult] = None
+
+        while True:
+            code, otp_phase = self._phase_otp_secondary(
+                PhaseContext(otp_sent_at=self._otp_sent_at),
+                started_at=otp_phase_started_at,
+            )
+            if code:
+                return code, otp_phase
+
+            if otp_phase and not otp_phase.retryable:
+                return None, otp_phase
+
+            retry_error_code = otp_phase.error_code if otp_phase else ""
+            retry_reason = (
+                "non_openai_sender"
+                if retry_error_code == OTP_NO_OPENAI_SENDER_ERROR
+                else "timeout"
+            )
+
+            if retry_reason == "non_openai_sender":
+                if non_openai_sender_resend_used >= non_openai_sender_resend_max:
+                    return None, otp_phase
+                non_openai_sender_resend_used += 1
+                resend_attempt = non_openai_sender_resend_used
+                self._log(non_openai_retry_log_template.format(attempt=resend_attempt))
+                status_template = non_openai_retry_status_template
+            else:
+                if timeout_resend_used >= timeout_resend_max:
+                    return None, otp_phase
+                timeout_resend_used += 1
+                resend_attempt = timeout_resend_used
+                self._log(timeout_retry_log_template.format(attempt=resend_attempt))
+                status_template = timeout_retry_status_template
+
+            if status_template:
+                emit_kwargs = {}
+                if step_index is not None:
+                    emit_kwargs["step_index"] = step_index
+                self._emit_status(
+                    "otp_resend",
+                    status_template.format(attempt=resend_attempt),
+                    **emit_kwargs,
+                )
+
+            if not resend_callback():
+                self._log("重新发送验证码失败，跳过本次重试", "warning")
+
+            otp_phase_started_at = time.time()
+
+        return None, otp_phase
 
     def _phase_otp_secondary(
         self,
@@ -1330,9 +1396,18 @@ class RegistrationEngine:
         if not self._submit_login_password_step():
             return None, None
 
-        code = self._get_verification_code()
+        code, otp_phase = self._await_verification_code_with_resends(
+            self._submit_login_password_step,
+            timeout_retry_log_template="登录流程未找到验证码，第 {attempt} 次重新触发登录验证码...",
+            non_openai_retry_log_template="登录流程检测到非 OpenAI 发件人干扰，第 {attempt} 次重新触发登录验证码...",
+            timeout_retry_status_template="重新触发登录验证码（第 {attempt} 次）",
+            non_openai_retry_status_template="重新触发登录验证码（非 OpenAI 发件人，第 {attempt} 次）",
+        )
         if not code:
-            self._log("登录流程获取验证码失败", "warning")
+            self._log(
+                otp_phase.error_message if otp_phase and otp_phase.error_message else "登录流程获取验证码失败",
+                "warning",
+            )
             return None, None
 
         valid, consent_url = self._validate_verification_code_and_get_continue_url(code)
@@ -1559,57 +1634,14 @@ class RegistrationEngine:
             # 10. 获取验证码（支持重发重试）
             self._log("10. 等待验证码...")
             self._emit_status("otp_secondary", "等待验证码邮件", step_index=10)
-            otp_phase_started_at = time.time()
-            settings = get_settings()
-            timeout_resend_max = settings.email_code_resend_max_retries
-            non_openai_sender_resend_max = settings.email_code_non_openai_sender_resend_max_retries
-            timeout_resend_used = 0
-            non_openai_sender_resend_used = 0
-            code, otp_phase = None, None
-            while True:
-                code, otp_phase = self._phase_otp_secondary(
-                    PhaseContext(otp_sent_at=self._otp_sent_at),
-                    started_at=otp_phase_started_at,
-                )
-                if code:
-                    break
-
-                retry_error_code = otp_phase.error_code if otp_phase else ""
-                retry_reason = (
-                    "non_openai_sender"
-                    if retry_error_code == OTP_NO_OPENAI_SENDER_ERROR
-                    else "timeout"
-                )
-
-                if retry_reason == "non_openai_sender":
-                    if non_openai_sender_resend_used >= non_openai_sender_resend_max:
-                        break
-                    non_openai_sender_resend_used += 1
-                    resend_attempt = non_openai_sender_resend_used
-                    self._log(
-                        f"10. 检测到非 OpenAI 发件人干扰，第 {resend_attempt} 次重新发送验证码..."
-                    )
-                    self._emit_status(
-                        "otp_resend",
-                        f"重新发送验证码（非 OpenAI 发件人，第 {resend_attempt} 次）",
-                        step_index=10,
-                    )
-                else:
-                    if timeout_resend_used >= timeout_resend_max:
-                        break
-                    timeout_resend_used += 1
-                    resend_attempt = timeout_resend_used
-                    self._log(f"10. 收件箱未找到验证码，第 {resend_attempt} 次重新发送验证码...")
-                    self._emit_status(
-                        "otp_resend",
-                        f"重新发送验证码（第 {resend_attempt} 次）",
-                        step_index=10,
-                    )
-
-                if not self._send_verification_code():
-                    self._log("重新发送验证码失败，跳过本次重试", "warning")
-
-                otp_phase_started_at = time.time()
+            code, otp_phase = self._await_verification_code_with_resends(
+                self._send_verification_code,
+                timeout_retry_log_template="10. 收件箱未找到验证码，第 {attempt} 次重新发送验证码...",
+                non_openai_retry_log_template="10. 检测到非 OpenAI 发件人干扰，第 {attempt} 次重新发送验证码...",
+                timeout_retry_status_template="重新发送验证码（第 {attempt} 次）",
+                non_openai_retry_status_template="重新发送验证码（非 OpenAI 发件人，第 {attempt} 次）",
+                step_index=10,
+            )
             if not code:
                 result.error_message = (
                     otp_phase.error_message if otp_phase and otp_phase.error_message else "获取验证码失败"

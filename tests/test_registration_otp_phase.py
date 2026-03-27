@@ -244,7 +244,7 @@ def test_run_keeps_timeout_budget_after_non_openai_sender_resend(monkeypatch):
     assert len(send_calls) == 4
 
 
-def test_advance_login_authorization_sets_otp_anchor_before_password_submit(monkeypatch):
+def test_advance_login_authorization_sets_otp_anchor_before_retryable_wait(monkeypatch):
     email_service = FakeEmailService(code=None)
     engine = _build_engine(monkeypatch, email_service)
     engine.oauth_start = object()
@@ -264,11 +264,12 @@ def test_advance_login_authorization_sets_otp_anchor_before_password_submit(monk
 
     monkeypatch.setattr(engine, "_submit_login_password_step", fake_submit_login_password_step)
 
-    def fake_get_verification_code():
+    def fake_wait_for_verification_code(resend_callback, **_kwargs):
         seen_anchors.append(engine._otp_sent_at)
-        return None
+        assert resend_callback is engine._submit_login_password_step
+        return None, _build_failed_phase("OTP_NO_OPENAI_SENDER", "detected non-openai sender")
 
-    monkeypatch.setattr(engine, "_get_verification_code", fake_get_verification_code)
+    monkeypatch.setattr(engine, "_await_verification_code_with_resends", fake_wait_for_verification_code)
 
     workspace_id, callback_url = engine._advance_login_authorization()
 

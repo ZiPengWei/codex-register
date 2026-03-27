@@ -470,6 +470,11 @@ class ProxyCreateRequest(BaseModel):
     priority: int = 0
 
 
+class ProxyBatchDeleteRequest(BaseModel):
+    """批量删除代理请求"""
+    ids: List[int]
+
+
 class ProxyUpdateRequest(BaseModel):
     """更新代理请求"""
     name: Optional[str] = None
@@ -561,6 +566,35 @@ async def create_proxy_item(request: ProxyCreateRequest):
             priority=request.priority
         )
         return {"success": True, "proxy": proxy.to_dict()}
+
+
+@router.post("/proxies/batch-delete")
+async def batch_delete_proxies(request: ProxyBatchDeleteRequest):
+    """批量删除代理。"""
+    if not request.ids:
+        raise HTTPException(status_code=400, detail="请至少选择一个代理")
+
+    with get_db() as db:
+        result = crud.delete_proxies_by_ids(db, request.ids)
+        return {
+            "success": True,
+            "requested_count": result["requested_count"],
+            "deleted_count": result["deleted_count"],
+            "not_found_ids": result["not_found_ids"],
+            "message": f"已删除 {result['deleted_count']} 个代理",
+        }
+
+
+@router.post("/proxies/delete-disabled")
+async def delete_disabled_proxy_items():
+    """删除所有已禁用代理。"""
+    with get_db() as db:
+        deleted_count = crud.delete_disabled_proxies(db)
+        return {
+            "success": True,
+            "deleted_count": deleted_count,
+            "message": f"已删除 {deleted_count} 个禁用代理",
+        }
 
 
 @router.get("/proxies/{proxy_id}")
