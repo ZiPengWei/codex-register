@@ -236,6 +236,7 @@ class CloudMailService(BaseEmailService):
         seen_mail_ids: set = set()
 
         while time.time() - start_time < timeout:
+            self._raise_if_cancelled("等待 Cloud Mail 验证码时任务已取消")
             try:
                 token = self._get_public_token()
                 mails = self._make_request(
@@ -253,7 +254,7 @@ class CloudMailService(BaseEmailService):
                     mails = mails["list"]
 
                 if not isinstance(mails, list):
-                    time.sleep(poll_interval)
+                    self._sleep_with_cancel(poll_interval)
                     continue
 
                 if mails:
@@ -302,7 +303,7 @@ class CloudMailService(BaseEmailService):
                     raise
                 logger.debug(f"检查 Cloud Mail 邮件时出错: {e}")
 
-            time.sleep(poll_interval)
+            self._sleep_with_cancel(poll_interval)
 
         logger.warning(f"等待 Cloud Mail 验证码超时: {email}")
         return None

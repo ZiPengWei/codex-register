@@ -9,7 +9,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Callable
 from enum import Enum
 
 from ..config.constants import EmailServiceType, OPENAI_EMAIL_SENDERS, OTP_CODE_PATTERN, OTP_CODE_SEMANTIC_PATTERN
@@ -139,6 +139,10 @@ class OTPNoOpenAISenderEmailServiceError(EmailServiceError):
         self.error_code = error_code
 
 
+class EmailServiceCancelledError(EmailServiceError):
+    """邮箱服务在轮询过程中收到取消信号。"""
+
+
 class EmailServiceStatus(Enum):
     """邮箱服务状态"""
     HEALTHY = "healthy"
@@ -168,6 +172,7 @@ class BaseEmailService(abc.ABC):
         self._provider_backoff = reset_adaptive_backoff()
         self._used_verification_codes: Dict[str, set] = {}
         self._seen_verification_messages: Dict[str, set] = {}
+        self.check_cancelled: Optional[Callable[[], bool]] = None
 
     _EMAIL_ADDRESS_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
@@ -189,6 +194,35 @@ class BaseEmailService(abc.ABC):
     def apply_provider_backoff_state(self, state: Optional[EmailProviderBackoffState]) -> None:
         """注入外部持久化的邮箱供应商退避状态"""
         self._provider_backoff = state or reset_adaptive_backoff()
+
+    def set_check_cancelled(self, callback: Optional[Callable[[], bool]]) -> None:
+        """注入外部取消检查回调。"""
+        self.check_cancelled = callback if callable(callback) else None
+
+    def _is_cancelled_requested(self) -> bool:
+        """检查邮箱服务是否收到取消请求。"""
+        callback = self.check_cancelled
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback())
+        except Exception as e:
+            logger.warning(f"检查邮箱服务取消状态失败: {e}")
+            return False
+
+    def _raise_if_cancelled(self, message: str = "任务已取消") -> None:
+        """在轮询/等待阶段响应取消请求。"""
+        if self._is_cancelled_requested():
+            raise EmailServiceCancelledError(message)
+
+    def _sleep_with_cancel(self, seconds: float, chunk_seconds: float = 0.2) -> None:
+        """可响应取消的短分片休眠。"""
+        remaining = max(0.0, float(seconds))
+        while remaining > 0:
+            self._raise_if_cancelled()
+            sleep_for = min(chunk_seconds, remaining)
+            time.sleep(sleep_for)
+            remaining -= sleep_for
 
     @abc.abstractmethod
     def create_email(self, config: Dict[str, Any] = None) -> Dict[str, Any]:
@@ -520,6 +554,7 @@ class BaseEmailService(abc.ABC):
         last_email_id = None
 
         while time.time() - start_time < timeout:
+            self._raise_if_cancelled("等待邮件时任务已取消")
             try:
                 emails = self.list_emails()
                 for email_info in emails:
@@ -562,7 +597,7 @@ class BaseEmailService(abc.ABC):
             except Exception as e:
                 logger.warning(f"等待邮件时出错: {e}")
 
-            time.sleep(check_interval)
+            self._sleep_with_cancel(check_interval)
 
         return None
 

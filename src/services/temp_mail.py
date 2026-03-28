@@ -309,6 +309,7 @@ class TempMailService(BaseEmailService):
         # jwt = cached.get("jwt")
 
         while time.time() - start_time < timeout:
+            self._raise_if_cancelled("等待 TempMail 验证码时任务已取消")
             try:
                 # if jwt:
                 #     response = self._make_request(
@@ -327,7 +328,7 @@ class TempMailService(BaseEmailService):
                 # /user_api/mails 和 /admin/mails 返回格式相同: {"results": [...], "total": N}
                 mails = response.get("results", [])
                 if not isinstance(mails, list):
-                    time.sleep(poll_interval)
+                    self._sleep_with_cancel(poll_interval)
                     continue
 
                 ordered_mails = self._sort_items_by_message_time(
@@ -389,7 +390,7 @@ class TempMailService(BaseEmailService):
                     raise
                 logger.debug(f"检查 TempMail 邮件时出错: {e}")
 
-            time.sleep(poll_interval)
+            self._sleep_with_cancel(poll_interval)
 
         logger.warning(f"等待 TempMail 验证码超时: {email}")
         return None

@@ -31,6 +31,7 @@ from ..database import crud
 from ..database.session import get_db
 from ..services import BaseEmailService
 from ..services.base import (
+    EmailServiceCancelledError,
     EmailProviderBackoffState,
     OTP_NO_OPENAI_SENDER_ERROR,
     OTPNoOpenAISenderEmailServiceError,
@@ -43,6 +44,15 @@ PHASE_EMAIL_PREPARE = "email_prepare"
 PHASE_OTP_SECONDARY = "otp_secondary"
 ERROR_EMAIL_PROVIDER_RATE_LIMITED = "EMAIL_PROVIDER_RATE_LIMITED"
 ERROR_OTP_TIMEOUT_SECONDARY = "OTP_TIMEOUT_SECONDARY"
+ERROR_TASK_CANCELLED = "TASK_CANCELLED"
+
+
+class TaskCancelledError(Exception):
+    """注册任务被主动取消。"""
+
+    def __init__(self, message: str = "任务已取消"):
+        super().__init__(message)
+        self.error_code = ERROR_TASK_CANCELLED
 
 
 @dataclass
@@ -185,6 +195,8 @@ class RegistrationEngine:
         self._otp_sent_at: Optional[float] = None  # OTP 发送时间戳
         self._is_existing_account: bool = False  # 是否为已注册账号（用于自动登录）
         self.phase_history: list[PhaseResult] = []
+        self.check_cancelled: Optional[Callable[[], bool]] = None
+        self._cancel_logged = False
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -273,6 +285,35 @@ class RegistrationEngine:
         ]
         self.phase_history.append(phase_result)
         return phase_result
+
+    def _is_cancelled_requested(self) -> bool:
+        """检查是否收到外部取消信号。"""
+        callback = self.check_cancelled
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback())
+        except Exception as e:
+            logger.warning(f"检查任务取消状态失败: {e}")
+            return False
+
+    def _raise_if_cancelled(self, message: str = "任务已取消"):
+        """在可协作阶段检查取消请求。"""
+        if not self._is_cancelled_requested():
+            return
+        if not self._cancel_logged:
+            self._log(message, "warning")
+            self._cancel_logged = True
+        raise TaskCancelledError(message)
+
+    def _sleep_with_cancel(self, seconds: float, chunk_seconds: float = 0.2):
+        """可响应取消的短分片休眠。"""
+        remaining = max(0.0, float(seconds))
+        while remaining > 0:
+            self._raise_if_cancelled()
+            sleep_for = min(chunk_seconds, remaining)
+            time.sleep(sleep_for)
+            remaining -= sleep_for
 
     def _get_phase_result(self, phase_name: str) -> Optional[PhaseResult]:
         for phase_result in reversed(self.phase_history):
@@ -427,7 +468,7 @@ class RegistrationEngine:
                 )
 
             if attempt < max_attempts:
-                time.sleep(attempt)
+                self._sleep_with_cancel(attempt)
                 self.http_client.close()
                 self.session = self.http_client.session
 
@@ -656,6 +697,7 @@ class RegistrationEngine:
         otp_phase: Optional[PhaseResult] = None
 
         while True:
+            self._raise_if_cancelled("等待验证码重试时任务已取消")
             code, otp_phase = self._phase_otp_secondary(
                 PhaseContext(otp_sent_at=self._otp_sent_at),
                 started_at=otp_phase_started_at,
@@ -698,6 +740,7 @@ class RegistrationEngine:
                     **emit_kwargs,
                 )
 
+            self._raise_if_cancelled("等待验证码重试时任务已取消")
             if not resend_callback():
                 self._log("重新发送验证码失败，跳过本次重试", "warning")
 
@@ -712,76 +755,79 @@ class RegistrationEngine:
     ) -> Tuple[Optional[str], PhaseResult]:
         """等待二次验证码邮件并做超时归因。"""
         try:
+            self._raise_if_cancelled("等待验证码时任务已取消")
             self._log(f"正在等待邮箱 {self.email} 的验证码...")
 
             email_id = self.email_info.get("service_id") if self.email_info else None
+            settings = get_settings()
             budget = Budget(
-                timeout_seconds=get_settings().email_code_timeout,
+                timeout_seconds=settings.email_code_timeout,
                 started_at=started_at if started_at is not None else time.time(),
             )
-            remaining_timeout = budget.remaining_seconds()
+            poll_interval = max(1, int(settings.email_code_poll_interval or 1))
 
-            if remaining_timeout <= 0:
+            while True:
+                self._raise_if_cancelled("等待验证码时任务已取消")
+                remaining_timeout = budget.remaining_seconds()
+
+                if remaining_timeout <= 0:
+                    phase_result = self._record_phase_result(
+                        PhaseResult(
+                            phase=PHASE_OTP_SECONDARY,
+                            success=False,
+                            error_message="等待验证码超时",
+                            error_code=ERROR_OTP_TIMEOUT_SECONDARY,
+                            retryable=True,
+                            next_action="await_email",
+                            metadata={
+                                "budget_started_at": budget.started_at,
+                                "budget_timeout_seconds": budget.timeout_seconds,
+                                "otp_sent_at": context.otp_sent_at,
+                            },
+                        )
+                    )
+                    self._log(phase_result.error_message, "error")
+                    return None, phase_result
+
+                attempt_timeout = max(1, min(remaining_timeout, poll_interval))
+                code = self.email_service.get_verification_code(
+                    email=self.email,
+                    email_id=email_id,
+                    timeout=attempt_timeout,
+                    pattern=OTP_CODE_PATTERN,
+                    otp_sent_at=context.otp_sent_at,
+                )
+
+                if code:
+                    self._log(f"成功获取验证码: {code}")
+                    phase_result = self._record_phase_result(
+                        PhaseResult(
+                            phase=PHASE_OTP_SECONDARY,
+                            success=True,
+                            metadata={
+                                "budget_started_at": budget.started_at,
+                                "budget_timeout_seconds": budget.timeout_seconds,
+                                "otp_sent_at": context.otp_sent_at,
+                            },
+                        )
+                    )
+                    return code, phase_result
+
+        except Exception as e:
+            if isinstance(e, (TaskCancelledError, EmailServiceCancelledError)):
                 phase_result = self._record_phase_result(
                     PhaseResult(
                         phase=PHASE_OTP_SECONDARY,
                         success=False,
-                        error_message="等待验证码超时",
-                        error_code=ERROR_OTP_TIMEOUT_SECONDARY,
-                        retryable=True,
-                        next_action="await_email",
-                        metadata={
-                            "budget_started_at": budget.started_at,
-                            "budget_timeout_seconds": budget.timeout_seconds,
-                            "otp_sent_at": context.otp_sent_at,
-                        },
+                        error_message=str(e),
+                        error_code=getattr(e, "error_code", ERROR_TASK_CANCELLED),
+                        retryable=False,
+                        next_action="cancelled",
+                        metadata={"otp_sent_at": context.otp_sent_at},
                     )
                 )
-                self._log(phase_result.error_message, "error")
                 return None, phase_result
 
-            code = self.email_service.get_verification_code(
-                email=self.email,
-                email_id=email_id,
-                timeout=remaining_timeout,
-                pattern=OTP_CODE_PATTERN,
-                otp_sent_at=context.otp_sent_at,
-            )
-
-            if code:
-                self._log(f"成功获取验证码: {code}")
-                phase_result = self._record_phase_result(
-                    PhaseResult(
-                        phase=PHASE_OTP_SECONDARY,
-                        success=True,
-                        metadata={
-                            "budget_started_at": budget.started_at,
-                            "budget_timeout_seconds": budget.timeout_seconds,
-                            "otp_sent_at": context.otp_sent_at,
-                        },
-                    )
-                )
-                return code, phase_result
-
-            phase_result = self._record_phase_result(
-                PhaseResult(
-                    phase=PHASE_OTP_SECONDARY,
-                    success=False,
-                    error_message="等待验证码超时",
-                    error_code=ERROR_OTP_TIMEOUT_SECONDARY,
-                    retryable=True,
-                    next_action="await_email",
-                    metadata={
-                        "budget_started_at": budget.started_at,
-                        "budget_timeout_seconds": budget.timeout_seconds,
-                        "otp_sent_at": context.otp_sent_at,
-                    },
-                )
-            )
-            self._log(phase_result.error_message, "error")
-            return None, phase_result
-
-        except Exception as e:
             if isinstance(e, OTPNoOpenAISenderEmailServiceError):
                 self._log(str(e), "warning")
                 phase_result = self._record_phase_result(
@@ -1404,6 +1450,8 @@ class RegistrationEngine:
             non_openai_retry_status_template="重新触发登录验证码（非 OpenAI 发件人，第 {attempt} 次）",
         )
         if not code:
+            if otp_phase and otp_phase.error_code == ERROR_TASK_CANCELLED:
+                raise TaskCancelledError(otp_phase.error_message or "登录流程已取消")
             self._log(
                 otp_phase.error_message if otp_phase and otp_phase.error_message else "登录流程获取验证码失败",
                 "warning",
@@ -1539,11 +1587,13 @@ class RegistrationEngine:
         result = RegistrationResult(success=False, logs=self.logs)
 
         try:
+            self._raise_if_cancelled()
             self._log("=" * 60)
             self._log("开始注册流程")
             self._log("=" * 60)
 
             # 1. 检查 IP 地理位置
+            self._raise_if_cancelled()
             self._log("1. 检查 IP 地理位置...")
             self._emit_status("ip_check", "检查 IP 地理位置", step_index=1)
             ip_ok, location = self._check_ip_location()
@@ -1555,6 +1605,7 @@ class RegistrationEngine:
             self._log(f"IP 位置: {location}")
 
             # 2. 创建邮箱
+            self._raise_if_cancelled()
             self._log("2. 创建邮箱...")
             self._emit_status("email_prepare", "创建邮箱地址", step_index=2)
             if not self._phase_email_prepare():
@@ -1570,6 +1621,7 @@ class RegistrationEngine:
             result.email = self.email
 
             # 3. 初始化会话
+            self._raise_if_cancelled()
             self._log("3. 初始化会话...")
             self._emit_status("session_init", "初始化 HTTP 会话", step_index=3)
             if not self._init_session():
@@ -1577,6 +1629,7 @@ class RegistrationEngine:
                 return result
 
             # 4. 开始 OAuth 流程
+            self._raise_if_cancelled()
             self._log("4. 开始 OAuth 授权流程...")
             self._emit_status("oauth_start", "开始 OAuth 授权流程", step_index=4)
             if not self._start_oauth():
@@ -1584,6 +1637,7 @@ class RegistrationEngine:
                 return result
 
             # 5. 获取 Device ID
+            self._raise_if_cancelled()
             self._log("5. 获取 Device ID...")
             self._emit_status("oauth_device_id", "获取 Device ID", step_index=5)
             did = self._get_device_id()
@@ -1592,6 +1646,7 @@ class RegistrationEngine:
                 return result
 
             # 6. 检查 Sentinel 拦截
+            self._raise_if_cancelled()
             self._log("6. 检查 Sentinel 拦截...")
             self._emit_status("sentinel", "检查 Sentinel 拦截", step_index=6)
             sen_token = self._check_sentinel(did)
@@ -1601,6 +1656,7 @@ class RegistrationEngine:
                 self._log("Sentinel 检查失败或未启用", "warning")
 
             # 7. 提交注册表单 + 解析响应判断账号状态
+            self._raise_if_cancelled()
             self._log("7. 提交注册表单...")
             self._emit_status("signup_submit", "提交注册表单", step_index=7)
             signup_result = self._submit_signup_form(did, sen_token)
@@ -1612,6 +1668,7 @@ class RegistrationEngine:
             if self._is_existing_account:
                 self._log("8. [已注册账号] 跳过密码设置，OTP 已自动发送")
             else:
+                self._raise_if_cancelled()
                 self._log("8. 注册密码...")
                 self._emit_status("signup_password", "提交注册密码", step_index=8)
                 password_ok, password = self._register_password()
@@ -1625,6 +1682,7 @@ class RegistrationEngine:
                 # 已注册账号的 OTP 在提交表单时已自动发送，记录时间戳
                 self._otp_sent_at = time.time()
             else:
+                self._raise_if_cancelled()
                 self._log("9. 发送验证码...")
                 self._emit_status("otp_send", "发送验证码", step_index=9)
                 if not self._send_verification_code():
@@ -1632,6 +1690,7 @@ class RegistrationEngine:
                     return result
 
             # 10. 获取验证码（支持重发重试）
+            self._raise_if_cancelled()
             self._log("10. 等待验证码...")
             self._emit_status("otp_secondary", "等待验证码邮件", step_index=10)
             code, otp_phase = self._await_verification_code_with_resends(
@@ -1650,6 +1709,7 @@ class RegistrationEngine:
                 return result
 
             # 11. 验证验证码
+            self._raise_if_cancelled()
             self._log("11. 验证验证码...")
             self._emit_status("otp_validate", "校验验证码", step_index=11)
             if not self._validate_verification_code(code):
@@ -1660,6 +1720,7 @@ class RegistrationEngine:
             if self._is_existing_account:
                 self._log("12. [已注册账号] 跳过创建用户账户")
             else:
+                self._raise_if_cancelled()
                 self._log("12. 创建用户账户...")
                 self._emit_status("account_create", "创建 OpenAI 账户资料", step_index=12)
                 if not self._create_user_account():
@@ -1670,6 +1731,7 @@ class RegistrationEngine:
             callback_url = None
 
             if not self._is_existing_account:
+                self._raise_if_cancelled()
                 self._log(f"{next_step}. [新账号] 推进 Codex 授权流程...")
                 self._emit_status("oauth_reentry", "推进 Codex 授权流程", step_index=next_step)
                 workspace_id, callback_url = self._advance_login_authorization()
@@ -1679,6 +1741,7 @@ class RegistrationEngine:
 
             if not result.workspace_id:
                 # 获取 Workspace ID
+                self._raise_if_cancelled()
                 self._log(f"{next_step}. 获取 Workspace ID...")
                 self._emit_status("workspace_extract", "从授权态提取 Workspace ID", step_index=next_step)
                 workspace_id = self._get_workspace_id()
@@ -1691,6 +1754,7 @@ class RegistrationEngine:
                 next_step += 1
 
                 # 选择 Workspace
+                self._raise_if_cancelled()
                 self._log(f"{next_step}. 选择 Workspace...")
                 self._emit_status("workspace_select", "选择 Workspace", step_index=next_step)
                 continue_url = self._select_workspace(result.workspace_id)
@@ -1701,6 +1765,7 @@ class RegistrationEngine:
                 next_step += 1
 
                 # 跟随重定向链
+                self._raise_if_cancelled()
                 self._log(f"{next_step}. 跟随重定向链...")
                 self._emit_status("redirect_chain", "跟随授权重定向链", step_index=next_step)
                 callback_url = self._follow_redirects(continue_url)
@@ -1711,6 +1776,7 @@ class RegistrationEngine:
             next_step += 1
 
             # 处理 OAuth 回调
+            self._raise_if_cancelled()
             self._log(f"{next_step}. 处理 OAuth 回调...")
             self._emit_status("oauth_callback", "处理 OAuth 回调", step_index=next_step)
             token_info = self._handle_oauth_callback(callback_url)
@@ -1755,6 +1821,11 @@ class RegistrationEngine:
                 "registration_mode": self._resolved_execution_mode(),
             }
 
+            return result
+
+        except TaskCancelledError as e:
+            result.error_message = str(e)
+            result.error_code = getattr(e, "error_code", ERROR_TASK_CANCELLED)
             return result
 
         except Exception as e:

@@ -308,13 +308,14 @@ class MeoMailEmailService(BaseEmailService):
         seen_message_ids = set()
 
         while time.time() - start_time < timeout:
+            self._raise_if_cancelled("等待自定义域名邮箱验证码时任务已取消")
             try:
                 # 获取邮件列表
                 response = self._make_request("GET", f"/api/emails/{target_email_id}")
 
                 messages = response.get("messages", [])
                 if not isinstance(messages, list):
-                    time.sleep(poll_interval)
+                    self._sleep_with_cancel(poll_interval)
                     continue
 
                 ordered_messages = self._sort_items_by_message_time(
@@ -380,7 +381,7 @@ class MeoMailEmailService(BaseEmailService):
                 logger.debug(f"检查邮件时出错: {e}")
 
             # 等待一段时间再检查
-            time.sleep(poll_interval)
+            self._sleep_with_cancel(poll_interval)
 
         logger.warning(f"等待验证码超时: {email}")
         return None

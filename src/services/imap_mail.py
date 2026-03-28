@@ -12,7 +12,7 @@ import logging
 from email.header import decode_header
 from typing import Any, Dict, Optional
 
-from .base import BaseEmailService, EmailServiceError, OTPNoOpenAISenderEmailServiceError, get_email_code_settings
+from .base import BaseEmailService, OTPNoOpenAISenderEmailServiceError, get_email_code_settings
 from ..config.constants import (
     EmailServiceType,
     OTP_CODE_SEMANTIC_PATTERN,
@@ -124,11 +124,12 @@ class ImapMailService(BaseEmailService):
             mail.select("INBOX")
 
             while time.time() - start_time < timeout:
+                self._raise_if_cancelled("等待 IMAP 验证码时任务已取消")
                 try:
                     # 搜索所有未读邮件
                     status, data = mail.search(None, "UNSEEN")
                     if status != "OK" or not data or not data[0]:
-                        time.sleep(poll_interval)
+                        self._sleep_with_cancel(poll_interval)
                         continue
 
                     msg_ids = data[0].split()
@@ -181,13 +182,13 @@ class ImapMailService(BaseEmailService):
                     except Exception:
                         pass
 
-                time.sleep(poll_interval)
+                self._sleep_with_cancel(poll_interval)
 
         except Exception as e:
             if isinstance(e, OTPNoOpenAISenderEmailServiceError):
                 raise
             logger.warning(f"IMAP 连接/轮询失败: {e}")
-            self.update_status(False, str(e))
+            self.update_status(False, e)
         finally:
             if mail:
                 try:

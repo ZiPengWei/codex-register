@@ -263,6 +263,7 @@ class DuckMailService(BaseEmailService):
         seen_message_ids = set()
 
         while time.time() - start_time < timeout:
+            self._raise_if_cancelled("等待 DuckMail 验证码时任务已取消")
             try:
                 response = self._make_request(
                     "GET",
@@ -324,7 +325,7 @@ class DuckMailService(BaseEmailService):
                     raise
                 logger.debug(f"DuckMail 轮询验证码失败: {e}")
 
-            time.sleep(poll_interval)
+            self._sleep_with_cancel(poll_interval)
 
         return None
 

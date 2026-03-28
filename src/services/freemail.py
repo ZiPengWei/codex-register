@@ -214,10 +214,11 @@ class FreemailService(BaseEmailService):
         seen_mail_ids: set = set()
 
         while time.time() - start_time < timeout:
+            self._raise_if_cancelled("等待 Freemail 验证码时任务已取消")
             try:
                 mails = self._make_request("GET", "/api/emails", params={"mailbox": email, "limit": 20})
                 if not isinstance(mails, list):
-                    time.sleep(poll_interval)
+                    self._sleep_with_cancel(poll_interval)
                     continue
 
                 ordered_mails = self._sort_items_by_message_time(
@@ -299,7 +300,7 @@ class FreemailService(BaseEmailService):
                     raise
                 logger.debug(f"检查 Freemail 邮件时出错: {e}")
 
-            time.sleep(poll_interval)
+            self._sleep_with_cancel(poll_interval)
 
         logger.warning(f"等待 Freemail 验证码超时: {email}")
         return None

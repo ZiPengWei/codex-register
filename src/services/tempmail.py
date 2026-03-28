@@ -217,6 +217,7 @@ class TempmailService(BaseEmailService):
         seen_ids = set()
 
         while time.time() - start_time < timeout:
+            self._raise_if_cancelled("等待 Tempmail 验证码时任务已取消")
             try:
                 # 获取邮件列表
                 response = self.http_client.get(
@@ -226,7 +227,7 @@ class TempmailService(BaseEmailService):
                 )
 
                 if response.status_code != 200:
-                    time.sleep(poll_interval)
+                    self._sleep_with_cancel(poll_interval)
                     continue
 
                 data = response.json()
@@ -239,7 +240,7 @@ class TempmailService(BaseEmailService):
                 email_list = data.get("emails", []) if isinstance(data, dict) else []
 
                 if not isinstance(email_list, list):
-                    time.sleep(poll_interval)
+                    self._sleep_with_cancel(poll_interval)
                     continue
 
                 ordered_emails = self._sort_items_by_message_time(
@@ -302,7 +303,7 @@ class TempmailService(BaseEmailService):
                 logger.debug(f"检查邮件时出错: {e}")
 
             # 等待一段时间再检查
-            time.sleep(poll_interval)
+            self._sleep_with_cancel(poll_interval)
 
         logger.warning(f"等待验证码超时: {email}")
         return None

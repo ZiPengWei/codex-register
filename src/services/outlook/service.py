@@ -337,6 +337,7 @@ class OutlookService(BaseEmailService):
         poll_count = 0
 
         while time.time() - start_time < actual_timeout:
+            self._raise_if_cancelled("等待 Outlook 验证码时任务已取消")
             poll_count += 1
 
             # 渐进式邮件检查：前 3 次只检查未读
@@ -387,7 +388,7 @@ class OutlookService(BaseEmailService):
                 logger.warning(f"[{email}] 检查出错: {e}")
 
             # 等待下次轮询
-            time.sleep(poll_interval)
+            self._sleep_with_cancel(poll_interval)
 
         elapsed = int(time.time() - start_time)
         logger.warning(f"[{email}] 验证码超时 ({actual_timeout}s)，共轮询 {poll_count} 次")
